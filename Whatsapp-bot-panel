@@ -1,0 +1,180 @@
+npm init -y
+npm install express whatsapp-web.js qrcode socket.io cors
+// Import necessary modules
+const express = require('express');
+const { Client, LocalAuth } = require('whatsapp-web.js'); // Import LocalAuth for session management
+const qrcode = require('qrcode'); // To generate QR code image data
+const socketio = require('socket.io'); // For real-time communication
+const http = require('http'); // For creating HTTP server for socket.io
+const cors = require('cors'); // To allow cross-origin requests from the frontend
+
+// Initialize Express app
+const app = express();
+const server = http.createServer(app); // Create HTTP server for Socket.io
+const io = socketio(server, {
+  cors: {
+    origin: "*", // Allow all origins for simplicity in this example. In production, specify your frontend URL.
+    methods: ["GET", "POST"]
+  }
+});
+
+const PORT = process.env.PORT || 8000; // Define port for the server
+
+// Middleware to parse JSON bodies
+app.use(express.json());
+// Enable CORS for all routes
+app.use(cors());
+
+// Initialize WhatsApp Client
+// LocalAuth will store session data in the .wwebjs_auth folder
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    args: [
+      '--no-sandbox', // Required for some environments
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process', // This might save some memory
+      '--disable-gpu' // Disables GPU hardware acceleration. If your platform doesn't have a GPU or has issues with GPU acceleration, this can help.
+    ]
+  }
+});
+
+let qrCodeDataUrl = null; // Variable to store QR code data URL
+let isClientReady = false; // Flag to track client readiness
+
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  console.log('A user connected via WebSocket');
+
+  // Send current status and QR code if available upon new connection
+  if (isClientReady) {
+    socket.emit('ready');
+  } else if (qrCodeDataUrl) {
+    socket.emit('qr', qrCodeDataUrl);
+  } else {
+    // If not ready and no QR, it means it's still initializing or disconnected
+    socket.emit('disconnected');
+  }
+
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log('User disconnected from WebSocket');
+  });
+});
+
+// WhatsApp Client events
+
+// QR Code event: This event is emitted when a QR code is generated.
+client.on('qr', (qr) => {
+  console.log('QR RECEIVED', qr);
+  // Generate QR code as a data URL (image format)
+  qrcode.toDataURL(qr, (err, url) => {
+    if (err) {
+      console.error('Error generating QR code:', err);
+      qrCodeDataUrl = null;
+    } else {
+      qrCodeDataUrl = url; // Store the QR code data URL
+      io.emit('qr', url); // Emit QR code to all connected clients via Socket.IO
+    }
+  });
+});
+
+// Ready event: This event is emitted when the client is ready to send and receive messages.
+client.on('ready', () => {
+  console.log('Client is ready!');
+  isClientReady = true;
+  qrCodeDataUrl = null; // Clear QR code once connected
+  io.emit('ready'); // Emit 'ready' status to all connected clients
+});
+
+// Message event: This event is emitted when a new message is received.
+client.on('message', (msg) => {
+  console.log('MESSAGE RECEIVED', msg.body);
+  // Emit the received message to all connected clients
+  io.emit('message', {
+    type: 'received',
+    from: msg.from,
+    body: msg.body,
+    timestamp: msg.timestamp
+  });
+
+  // Example: Basic auto-reply logic (can be extended based on your needs)
+  if (msg.body.toLowerCase() === 'halo') {
+    client.sendMessage(msg.from, 'Halo juga! Saya adalah bot WhatsApp.');
+  }
+});
+
+// Disconnected event: This event is emitted when the client is disconnected.
+client.on('disconnected', (reason) => {
+  console.log('Client was disconnected', reason);
+  isClientReady = false;
+  qrCodeDataUrl = null; // Clear QR code on disconnection
+  io.emit('disconnected', reason); // Emit 'disconnected' status
+  // Optionally, you can re-initialize the client here or prompt user to reconnect
+  // client.initialize();
+});
+
+// Authentication failure event
+client.on('auth_failure', (msg) => {
+  console.error('AUTHENTICATION FAILURE', msg);
+  isClientReady = false;
+  qrCodeDataUrl = null;
+  io.emit('auth_failure', msg);
+  // Consider deleting session files here if auth fails persistently
+});
+
+// Initialize the WhatsApp client
+// This will start the browser and try to connect or load session
+client.initialize();
+
+// API endpoint to send a message
+app.post('/send-message', async (req, res) => {
+  const { number, message } = req.body;
+
+  if (!number || !message) {
+    return res.status(400).json({ status: 'error', message: 'Nomor dan pesan diperlukan.' });
+  }
+
+  // WhatsApp numbers usually need to be in the format '6281234567890@c.us' for Indonesia
+  // The library handles this automatically if you provide a clean number (e.g., '6281234567890')
+  const formattedNumber = number.includes('@c.us') ? number : `${number}@c.us`;
+
+  if (!isClientReady) {
+    return res.status(503).json({ status: 'error', message: 'Bot belum siap. Silakan pindai QR code terlebih dahulu.' });
+  }
+
+  try {
+    await client.sendMessage(formattedNumber, message);
+    io.emit('message', {
+      type: 'sent',
+      to: formattedNumber,
+      body: message,
+      timestamp: Date.now() / 1000 // Convert to seconds for consistency
+    });
+    res.json({ status: 'success', message: 'Pesan berhasil dikirim!' });
+  } catch (error) {
+    console.error('Error sending message:', error);
+    res.status(500).json({ status: 'error', message: 'Gagal mengirim pesan.', details: error.message });
+  }
+});
+
+// API endpoint to get current status (optional, but good for initial load)
+app.get('/status', (req, res) => {
+  res.json({
+    status: isClientReady ? 'ready' : (qrCodeDataUrl ? 'qr_waiting' : 'disconnected'),
+    qrCode: qrCodeDataUrl // Send QR code if available
+  });
+});
+
+
+// Start the server
+server.listen(PORT, () => {
+  console.log(`Backend server berjalan di http://localhost:${PORT}`);
+  console.log('Menunggu koneksi WhatsApp...');
+});
+
+
